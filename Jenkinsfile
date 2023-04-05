@@ -1,65 +1,105 @@
 pipeline {
   agent any
+  environment {
+        ANDROID_HOME = "/usr/local/android-sdk"
+        GRADLE_HOME = "/usr/local/gradle"
+        APPCENTER_TOKEN = credentials('appcenter-token')
+        NEXUS_USERNAME = credentials('nexus-username')
+        NEXUS_PASSWORD = credentials('nexus-password')
+  }
   tools { 
         maven 'Maven_3_5_2'  
     }
    stages{
     stage('CompileandRunSonarAnalysis') {
             steps {	
-		sh 'mvn clean verify sonar:sonar -Dsonar.projectKey=asgbuggywebapp -Dsonar.organization=asgbuggywebapp -Dsonar.host.url=https://sonarcloud.io -Dsonar.login=932558e169d66a8f1d1adf470b908a46156f5844'
+		sh 'mvn clean verify sonar:sonar -Dsonar.projectKey=devsecopsproject -Dsonar.organization=devsecops2023 -Dsonar.host.url=https://sonarcloud.io -Dsonar.login=445f45ae0d23d026c8060aaa27955baa9f06bc1c'
 			}
     }
-
-	stage('RunSCAAnalysisUsingSnyk') {
-            steps {		
-				withCredentials([string(credentialsId: 'SNYK_TOKEN', variable: 'SNYK_TOKEN')]) {
-					sh 'mvn snyk:test -fn'
+	stage('Build') {
+            // Compila el proyecto de Android
+            steps {
+                sh "${GRADLE_HOME}/bin/gradle build"
+            }
+    }
+	stage('Test') {
+            // Ejecuta las pruebas unitarias de Android
+            steps {
+                sh "${GRADLE_HOME}/bin/gradle test"
+            }
+        }
+	stage('SonarQube Scan') {
+		// Escanea el proyecto con SonarQube
+		environment {
+			scannerHome = tool 'SonarScanner'
+		}
+		steps {
+			sh "${scannerHome}/bin/sonar-scanner"
+		}
+	}
+	stage('Sign APK') {
+		// Firma el archivo APK para su uso en producción
+		steps {
+			sh "echo 'Signing APK...'"
+			sh "./gradlew assembleRelease --stacktrace --no-daemon"
+		}
+	}
+	stage('Quality Gate') {
+		// Evalúa el resultado del análisis de SonarQube para el Quality Gate
+		steps {
+			script {
+				def qg = waitForQualityGate()
+				if (qg.status != 'OK') {
+					error "Pipeline aborted due to quality gate failure: ${qg.status}"
 				}
 			}
-    }
-
-	stage('Build') { 
-            steps { 
-               withDockerRegistry([credentialsId: "dockerlogin", url: ""]) {
-                 script{
-                 app =  docker.build("asg")
-                 }
-               }
-            }
-    }
-
-	stage('Push') {
-            steps {
-                script{
-                    docker.withRegistry('https://145988340565.dkr.ecr.us-west-2.amazonaws.com', 'ecr:us-west-2:aws-credentials') {
-                    app.push("latest")
-                    }
-                }
-            }
-    	}
-	   
-	stage('Kubernetes Deployment of ASG Bugg Web Application') {
-	   steps {
-	      withKubeConfig([credentialsId: 'kubelogin']) {
-		  sh('kubectl delete all --all -n devsecops')
-		  sh ('kubectl apply -f deployment.yaml --namespace=devsecops')
 		}
-	      }
-   	}
-	   
-	stage ('wait_for_testing'){
-	   steps {
-		   sh 'pwd; sleep 180; echo "Application Has been deployed on K8S"'
-	   	}
-	   }
-	   
-	stage('RunDASTUsingZAP') {
-          steps {
-		    withKubeConfig([credentialsId: 'kubelogin']) {
-				sh('zap.sh -cmd -quickurl http://$(kubectl get services/asgbuggy --namespace=devsecops -o json| jq -r ".status.loadBalancer.ingress[] | .hostname") -quickprogress -quickout ${WORKSPACE}/zap_report.html')
-				archiveArtifacts artifacts: 'zap_report.html'
-		    }
-	     }
-       } 
+	}
+	stage('Upload to App Center') {
+		// Sube el archivo APK a App Center si la calidad del código cumple con el Quality Gate
+		when {
+			expression { currentBuild.result == 'SUCCESS' }
+		}
+		steps {
+			withCredentials([string(credentialsId: 'appcenter-token', variable: 'APPCENTER_TOKEN')]) {
+				sh "echo 'Uploading APK to App Center...'"
+				sh "curl -X POST -H 'Content-Type: application/octet-stream' -H 'Accept: application/json' -H 'X-API-Token: $APPCENTER_TOKEN' https://api.appcenter.ms/v0.1/apps/your-username/your-appname/releases/upload -T app/build/outputs/apk/release/app-release.apk"
+			}
+		}
+	}
+	stage('Upload to Nexus') {
+		// Sube el archivo APK a Nexus si la calidad del código cumple con el Quality Gate
+		when {
+			expression { currentBuild.result == 'SUCCESS' }
+		}
+		steps {
+			withCredentials([usernamePassword(credentialsId: 'nexus-credentials', usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+				sh "echo 'Uploading APK to Nexus...'"
+				sh "curl -v -u $NEXUS_USERNAME:$NEXUS_PASSWORD --upload-file app/build/outputs/apk/release/app-release.apk https://nexus.example.com/repository/releases/your-appname/app-release.apk"
+			}
+		}
+    }
   }
+	post {
+		always {
+			junit 'app/build/test-results/**/*.xml'
+			archiveArtifacts 'app/build/outputs/**/*.apk'
+			publishHTML target: [
+				allowMissing: false,
+				alwaysLinkToLastBuild: true,
+				keepAll: true,
+				reportDir: 'app/build/reports',
+				reportFiles: 'index.html',
+				reportName: 'Test Report'
+			]
+		}
+		success {
+			script {
+				def qualityGate = waitForQualityGate()
+				if (qualityGate.status != 'OK') {
+					error "Pipeline failed due to quality gate status: ${qualityGate.status}"
+				}
+			}
+		}
+	}
 }
